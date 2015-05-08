@@ -1,0 +1,219 @@
+#!/bin/bash
+
+. bash_optparse << EOF
+SETTINGS_BEGIN
+  REQUIRED_VERSION 1.0
+SETTINGS_END
+
+DESCRIPTION_BEGIN
+  "Manage vim swap files recovery."
+  "If no input files are given, search the whole current directory."
+DESCRIPTION_END
+
+OPTIONS_BEGIN
+# OPTION       ARG      ARG    ARG                    DEFAULT       DESCRIPTION
+# NAME         TYPE     NAME   RANGE                  VALUE
+
+  quiet,q      NONE     NONE   NONE                   NONE          "Do not show diff or recovery summary"       
+
+OPTIONS_END
+
+ARGUMENTS_BEGIN
+# ARG          IS         DESCRIPTION
+# NAME         MANDATORY
+
+  VARARGS      FALSE      "input files"
+ARGUMENTS_END
+
+EOF
+
+function warnmess
+{
+	echo "$(basename $0): warning: $1" >> /dev/stderr;
+}
+
+function escape_for_egrep
+{
+	echo "$1" | sed "s/[][^\$\*?+\\().]/\\\\&/g" #| tee -a /dev/stderr
+}
+
+vim_exec="$(readlink -e "$(type -P vim)")"
+[[ -x "$vim_exec" ]] || abort "vim executable not found, aborting" 1
+
+
+diff_exec="$(readlink -e "$(type -P colordiff)")"
+[[ -x "$diff_exec" ]] || diff_exec="diff"
+
+function check_swap_file_is_in_use
+{
+	fuser "$1" &> /dev/null
+}
+
+function check_running_vim
+{
+	local file="$(escape_for_egrep "$1")"
+	local vim_pids_candidates
+	local vim_exec_candidate
+	local p
+	vim_pids_candidates=( $(ps aux | egrep "\<[egr]?(vim|view)(diff|\.gnome)?\>.*\<$file\>" | awk '{print $2}') )
+	if [[ ${#vim_pids_candidates[@]} -eq 0 ]]
+	then
+		return 1
+	fi
+	for p in "${vim_pids_candidates[@]}"
+	do
+		vim_exec_candidate="$(readlink -e /proc/$p/exe)"
+		if [[ "$vim_exec_candidate" == "$vim_exec" ]]
+		then
+			return 0
+		fi
+	done
+	return 1
+}
+
+function show_file_summary
+{
+	local filename="$1"
+	[[ -s "$filename" ]] || { echo "File is empty"; return; }
+	local numlines="$(cat "$filename" | wc -l)"
+	echo "Files contents:"
+	echo "---------------"
+	if [[ $numlines -gt 10 ]]
+	then
+		head -n 5 "$filename"
+		echo "[...]"
+		tail -n5 "$filename"
+	else
+		cat "$filename"
+	fi
+	echo "---------------"
+}
+
+
+function autofind_swaps
+{
+	local LIST SWP NF HF
+
+	LIST=""
+	while read HF
+	do
+		NF="\"${HF#\".}"
+		if eval [[ \( -f $HF \) \&\& \( ! -f $NF \) ]]
+		then
+			LIST="$LIST $HF"
+		else
+			LIST="$LIST $NF"
+		fi
+	done < <(ls -Q -1 .*.swp 2> /dev/null | sed "s/\.swp\"\$/\"/;s/\\\\/\\\\\\\\/g;s/\"/\\\\\"/g")
+	echo "$LIST"
+}
+
+if [ -z "$1" ]
+then
+	eval set -- "$(autofind_swaps)"
+	[ -z "$1" ] && { warnmess "no vim swap files found"; exit 0; }
+fi
+
+for ORIGFILE in "$@"
+do
+	ORIGBASE="$(basename "${ORIGFILE}")"
+	ORIGDIR="$(dirname "${ORIGFILE}")"
+	SWAPFILE="${ORIGDIR}/.${ORIGBASE#.}.swp"
+	RECFILE="${ORIGDIR}/${ORIGBASE}.recovery"
+
+	ESCRECFILE="$(echo "$RECFILE" | sed "s/\(.\)/\\\\\1/g")"
+
+	ORIGFILE_EXISTS="yes"
+
+	if ! [[ -f "$ORIGFILE" ]]
+	then
+		[[ -f "$SWAPFILE" ]] || { warnmess "skipping file '$ORIGFILE' (not found + swap file not found)"; continue; }
+		ORIGFILE_EXISTS="no"
+	fi
+
+	[[ -f "$SWAPFILE" ]] || { warnmess "skipping file '$ORIGFILE' (swap file not found)"; continue; }
+
+	check_running_vim "$ORIGFILE" && { warnmess "skipping file '$ORIGFILE' (open vim session found)"; continue; }
+	check_swap_file_is_in_use "$SWAPFILE" && { warnmess "skipping file '$ORIGFILE' (swap file is in use by another process)"; continue; }
+
+	vim -r "$ORIGFILE" -e -s -c ":sav! ${ESCRECFILE} | quit"
+
+	if ! [[ -f "$RECFILE" ]]
+	then
+		echo "Recovery of file '$ORIGFILE' failed, swap file may be invalid."
+		ANSWER="maybe"
+		while [[ $ANSWER != "yes" && "$ANSWER" != "no" && "$ANSWER" != "skip" && "$ANSWER" != "abort" ]]
+		do
+			echo -n "Delete swap file? (yes/no/abort) "
+			read ANSWER
+		done
+		if [[ $ANSWER == "yes" ]]
+		then
+			rm "$SWAPFILE"
+		elif [[ $ANSWER == "no" ]]
+		then
+			:
+		elif [[ $ANSWER == "abort" ]]
+		then
+			echo "Aborting"
+			exit 0;
+		else
+			abort "THIS IS BUG" 5
+		fi
+		continue;
+	fi
+
+	if [[ $ORIGFILE_EXISTS == "no" ]] || [[ $(diff -q "$ORIGFILE" "$RECFILE" | wc -l) > 0 ]]
+	then
+		if [[ $ORIGFILE_EXISTS == "yes" ]]
+		then
+			echo "File '$ORIGFILE' changed"
+			ORIGTIME=$(stat -c %Y "$ORIGFILE")
+			RECTIME=$(stat -c %Y "$SWAPFILE")
+			if [[ $ORIGTIME -gt $RECTIME ]]
+			then
+				echo "CURRENT file is more recent"
+			elif [[ $ORIGTIME -lt $RECTIME ]]
+			then
+				echo "RECOVERY file is more recent"
+			else
+				echo "CURRENT and RECOVERY files timestamps are equal"
+			fi
+			echo "[ < : CURRENT FILE ($(stat -c %y "$ORIGFILE"))]"
+			echo "[ > : VIM RECOVERY ($(stat -c %y "$SWAPFILE"))]"
+			[[ $quiet == "false" ]] && $diff_exec "$ORIGFILE" "$RECFILE"
+		else
+			echo "File '$ORIGFILE' does not exist, but swapfile found, recovery is possible"
+			[[ $quiet == "false" ]] && show_file_summary "$RECFILE"
+		fi
+		ANSWER="maybe"
+		while [[ $ANSWER != "yes" && "$ANSWER" != "no" && "$ANSWER" != "skip" && "$ANSWER" != "abort" ]]
+		do
+			echo -n "Recover file? (yes/no/skip/abort) "
+			read ANSWER
+		done
+		if [[ $ANSWER == "yes" ]]
+		then
+			mv "$RECFILE" "$ORIGFILE"
+			rm "$SWAPFILE"
+		elif [[ $ANSWER == "no" ]]
+		then
+			rm "$RECFILE"
+			rm "$SWAPFILE"
+		elif [[ $ANSWER == "skip" ]]
+		then
+			rm "$RECFILE"
+		elif [[ $ANSWER == "abort" ]]
+		then
+			rm "$RECFILE"
+			echo "Aborting"
+			exit
+		else
+			abort "THIS IS BUG" 5
+		fi
+	else
+		echo "File '$ORIGFILE' unchanged, deleting recovery"
+		rm "$RECFILE"
+		rm "$SWAPFILE"
+	fi
+done
