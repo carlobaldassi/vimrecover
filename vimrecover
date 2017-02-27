@@ -29,7 +29,7 @@ EOF
 
 function warnmess
 {
-	echo "$(basename $0): warning: $1" >> /dev/stderr;
+	echo "$(basename "$0"): warning: $1" >> /dev/stderr;
 }
 
 function escape_for_egrep
@@ -92,7 +92,7 @@ function show_file_summary
 
 function autofind_swaps
 {
-	local LIST SWP NF HF
+	local LIST NF HF
 
 	LIST=""
 	while read HF
@@ -116,6 +116,7 @@ fi
 
 for ORIGFILE in "$@"
 do
+	ORIGFILE="$(readlink -m "${ORIGFILE}")"
 	ORIGBASE="$(basename "${ORIGFILE}")"
 	ORIGDIR="$(dirname "${ORIGFILE}")"
 	SWAPFILE="${ORIGDIR}/.${ORIGBASE#.}.swp"
@@ -163,7 +164,7 @@ do
 		continue;
 	fi
 
-	if [[ $ORIGFILE_EXISTS == "no" ]] || [[ $(diff -q "$ORIGFILE" "$RECFILE" | wc -l) > 0 ]]
+	if [[ $ORIGFILE_EXISTS == "no" ]] || (( $(diff -q "$ORIGFILE" "$RECFILE" | wc -l) > 0 ))
 	then
 		if [[ $ORIGFILE_EXISTS == "yes" ]]
 		then
